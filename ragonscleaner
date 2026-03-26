@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+APP_NAME="ragonscleaner"
+APP_VERSION="1.0.0"
+COMPANY_NAME="Hostragons Global Limited"
+COMPANY_SITE="https://www.hostragons.com"
+COMPANY_TAGLINE="Fast, Secure & Professional Hosting Operations"
+
+# =========================
+# Colors
+# =========================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+TOTAL_FREED_BYTES=0
+START_USED_KB=0
+START_AVAIL_KB=0
+START_USE_PCT=""
+END_USED_KB=0
+END_AVAIL_KB=0
+END_USE_PCT=""
+
+# =========================
+# Helpers
+# =========================
+human_size() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" '
+    function human(x) {
+        s="B KB MB GB TB PB"
+        split(s,u," ")
+        i=1
+        while (x>=1024 && i<6) { x/=1024; i++ }
+        return sprintf("%.2f %s", x, u[i])
+    }
+    BEGIN { print human(b) }'
+}
+
+get_root_disk_stats() {
+    df -Pk / | awk 'NR==2 {print $3" "$4" "$5}'
+}
+
+capture_start_disk() {
+    local stats
+    stats="$(get_root_disk_stats)"
+    START_USED_KB="$(echo "$stats" | awk '{print $1}')"
+    START_AVAIL_KB="$(echo "$stats" | awk '{print $2}')"
+    START_USE_PCT="$(echo "$stats" | awk '{print $3}')"
+}
+
+capture_end_disk() {
+    local stats
+    stats="$(get_root_disk_stats)"
+    END_USED_KB="$(echo "$stats" | awk '{print $1}')"
+    END_AVAIL_KB="$(echo "$stats" | awk '{print $2}')"
+    END_USE_PCT="$(echo "$stats" | awk '{print $3}')"
+}
+
+sum_files_from_stdin_null() {
+    local total=0
+    local file size
+    while IFS= read -r -d '' file; do
+        [ -e "$file" ] || continue
+        size="$(stat -c '%s' "$file" 2>/dev/null || echo 0)"
+        total=$((total + size))
+    done
+    echo "$total"
+}
+
+sum_dir_contents_from_stdin_null() {
+    local total=0
+    local dir size
+    while IFS= read -r -d '' dir; do
+        [ -d "$dir" ] || continue
+        size="$(find "$dir" -mindepth 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+        total=$((total + size))
+    done
+    echo "$total"
+}
+
+add_total() {
+    TOTAL_FREED_BYTES=$((TOTAL_FREED_BYTES + $1))
+}
+
+require_root() {
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        echo -e "${RED}[ERROR]${NC} Please run this script as root."
+        exit 1
+    fi
+}
+
+line() {
+    echo -e "${CYAN}======================================================================${NC}"
+}
+
+section_line() {
+    echo -e "${DIM}----------------------------------------------------------------------${NC}"
+}
+
+print_header() {
+    clear 2>/dev/null || true
+    line
+    echo -e "${BOLD}${WHITE} ${APP_NAME} v${APP_VERSION}${NC}"
+    echo -e "${BOLD}${MAGENTA} ${COMPANY_NAME}${NC}"
+    echo -e "${CYAN} ${COMPANY_TAGLINE}${NC}"
+    echo -e "${DIM} ${COMPANY_SITE}${NC}"
+    line
+    echo -e "${YELLOW} This tool performs direct cleanup operations on a cPanel server.${NC}"
+    echo -e "${YELLOW} Target scope: backups, trash, temp, logs, mail spam/trash.${NC}"
+    echo
+}
+
+print_disk_box() {
+    local title="$1"
+    local used_kb="$2"
+    local avail_kb="$3"
+    local use_pct="$4"
+
+    echo -e "${BOLD}${BLUE}${title}${NC}"
+    echo -e "  ${WHITE}Used Space :${NC} $(human_size $((used_kb * 1024)))"
+    echo -e "  ${WHITE}Free Space :${NC} $(human_size $((avail_kb * 1024)))"
+    echo -e "  ${WHITE}Usage Rate :${NC} ${use_pct}"
+    echo
+}
+
+print_step() {
+    local num="$1"
+    local title="$2"
+    echo -e "${BOLD}${BLUE}[${num}]${NC} ${BOLD}${title}${NC}"
+}
+
+print_done() {
+    local bytes="$1"
+    echo -e "${GREEN}    Done.${NC} Freed: ${BOLD}$(human_size "$bytes")${NC}"
+    echo
+}
+
+# =========================
+# Cleanup Actions
+# =========================
+cleanup_backup_archives() {
+    print_step "1/11" "Removing cPanel user backup-*.tar.gz archives"
+    local bytes=0
+    bytes="$(find /home -type f -name 'backup-*.tar.gz' -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /home -type f -name 'backup-*.tar.gz' -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_user_trash() {
+    print_step "2/11" "Emptying all user .trash directories"
+    local bytes=0
+    bytes="$(find /home -type d -name '.trash' -print0 2>/dev/null | sum_dir_contents_from_stdin_null)"
+    find /home -type d -name '.trash' -exec bash -c '
+        for d in "$@"; do
+            [ -d "$d" ] || continue
+            find "$d" -mindepth 1 -delete 2>/dev/null
+        done
+    ' _ {} + 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_softaculous_backups() {
+    print_step "3/11" "Removing all softaculous_backups archives"
+    local bytes=0
+    bytes="$(find /home -type f -path '*/softaculous_backups/*.tar.gz' -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /home -type f -path '*/softaculous_backups/*.tar.gz' -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_error_logs() {
+    print_step "4/11" "Truncating all user error_log files"
+    local bytes=0
+    bytes="$(find /home -type f -name 'error_log' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    find /home -type f -name 'error_log' -exec truncate -s 0 {} \; 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_cpmove_archives() {
+    print_step "5/11" "Removing cpmove-*.tar.gz archives"
+    local bytes=0
+    bytes="$(find /home -type f -name 'cpmove-*.tar.gz' -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /home -type f -name 'cpmove-*.tar.gz' -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_wordpress_backups() {
+    print_step "6/11" "Removing wordpress-backups archives"
+    local bytes=0
+    bytes="$(find /home -type f -path '*/wordpress-backups/*.tar.gz' -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /home -type f -path '*/wordpress-backups/*.tar.gz' -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_tmp_dirs() {
+    print_step "7/11" "Cleaning /tmp and /var/tmp"
+    local bytes_tmp=0
+    local bytes_vartmp=0
+    local bytes=0
+
+    bytes_tmp="$(find /tmp -mindepth 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    bytes_vartmp="$(find /var/tmp -mindepth 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    bytes=$((bytes_tmp + bytes_vartmp))
+
+    find /tmp -mindepth 1 -delete 2>/dev/null
+    find /var/tmp -mindepth 1 -delete 2>/dev/null
+
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_cpanel_logs() {
+    print_step "8/11" "Removing old cPanel logs (older than 7 days)"
+    local bytes=0
+    bytes="$(find /usr/local/cpanel/logs -type f -mtime +7 -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /usr/local/cpanel/logs -type f -mtime +7 -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_user_access_logs() {
+    print_step "9/11" "Removing user access-logs files"
+    local bytes=0
+    bytes="$(find /home -type f -path '*/access-logs/*' -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /home -type f -path '*/access-logs/*' -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_old_system_logs() {
+    print_step "10/11" "Removing old system logs in /var/log (older than 7 days)"
+    local bytes=0
+    bytes="$(find /var/log -type f -mtime +7 -print0 2>/dev/null | sum_files_from_stdin_null)"
+    find /var/log -type f -mtime +7 -delete 2>/dev/null
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+cleanup_mail_spam_trash() {
+    print_step "11/11" "Removing mail Spam and Trash contents"
+    local bytes_spam=0
+    local bytes_trash=0
+    local bytes=0
+
+    bytes_spam="$(find /home -type f \( -path '*/mail/*/.Spam/*' -o -path '*/mail/*/*/.Spam/*' \) -print0 2>/dev/null | sum_files_from_stdin_null)"
+    bytes_trash="$(find /home -type f \( -path '*/mail/*/.Trash/*' -o -path '*/mail/*/*/.Trash/*' \) -print0 2>/dev/null | sum_files_from_stdin_null)"
+    bytes=$((bytes_spam + bytes_trash))
+
+    find /home -type f \( -path '*/mail/*/.Spam/*' -o -path '*/mail/*/*/.Spam/*' \) -delete 2>/dev/null
+    find /home -type f \( -path '*/mail/*/.Trash/*' -o -path '*/mail/*/*/.Trash/*' \) -delete 2>/dev/null
+
+    add_total "$bytes"
+    print_done "$bytes"
+}
+
+print_summary() {
+    local real_freed_kb=0
+    local real_freed_bytes=0
+
+    real_freed_kb=$((END_AVAIL_KB - START_AVAIL_KB))
+    real_freed_bytes=$((real_freed_kb * 1024))
+
+    line
+    echo -e "${BOLD}${GREEN} Cleanup completed successfully.${NC}"
+    line
+    echo
+
+    print_disk_box "Disk Usage Before Cleanup" "$START_USED_KB" "$START_AVAIL_KB" "$START_USE_PCT"
+    print_disk_box "Disk Usage After Cleanup" "$END_USED_KB" "$END_AVAIL_KB" "$END_USE_PCT"
+
+    section_line
+    echo -e "${BOLD}${MAGENTA}Cleanup Summary${NC}"
+    echo -e "  ${WHITE}Calculated Deleted Data :${NC} ${GREEN}$(human_size "$TOTAL_FREED_BYTES")${NC}"
+    echo -e "  ${WHITE}Actual Disk Space Gained:${NC} ${GREEN}$(human_size "$real_freed_bytes")${NC}"
+    section_line
+    echo
+}
+
+main() {
+    require_root
+    print_header
+
+    capture_start_disk
+    print_disk_box "Disk Usage Before Cleanup" "$START_USED_KB" "$START_AVAIL_KB" "$START_USE_PCT"
+
+    cleanup_backup_archives
+    cleanup_user_trash
+    cleanup_softaculous_backups
+    cleanup_error_logs
+    cleanup_cpmove_archives
+    cleanup_wordpress_backups
+    cleanup_tmp_dirs
+    cleanup_cpanel_logs
+    cleanup_user_access_logs
+    cleanup_old_system_logs
+    cleanup_mail_spam_trash
+
+    capture_end_disk
+    print_summary
+}
+
+main "$@"
