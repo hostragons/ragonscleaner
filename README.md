@@ -51,7 +51,7 @@ Hostragons is a global hosting provider founded in **2020**, relocated to **Lond
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ragonscleaner.git
+git clone https://github.com/hostragons/ragonscleaner.git
 cd ragonscleaner
 chmod +x ragonscleaner
 ```
